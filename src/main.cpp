@@ -9,7 +9,10 @@
  *   - bas/BAS_LIDAR_001/telemetry, khi co vong quet hoan chinh moi:
  *     {"sensor":"RPLIDAR-A1M8","status":"ok","unit":"mm","step_deg":1,...,"ranges":[360 so, 0 = khong co phan hoi]}
  * Doc lidar chay o task rieng (core 1, uu tien 2); loop Arduino (core 1) doc la ban.
- * USB Serial chi 115200: log trang thai [NET]/[LIDAR]/[POS] + lenh c/r/h va p/t/d (dinh vi).
+ * USB Serial chi 115200: log trang thai [NET]/[LIDAR]/[POS] + lenh c/r/h, p/t/d (dinh vi), m (dong co).
+ * Dong co DC: PWM=GPIO23 (LEDC 20 kHz), DIR=GPIO22. Dieu khien qua topic lenh
+ *   bas/DP_SHIP_001/cmd {"motor":-100..100} hoac {"stop":1}; telemetry co them truong "motor".
+ *   Failsafe: motor dang chay ma mat publish MQTT qua 5 s thi tu dung.
  * Ghep tu DPSHIP_COMPASS (la ban + mang) va firmware lidar goc cua repo (parser RPLIDAR).
  */
 
@@ -73,6 +76,12 @@
 #define LIDAR_MOTOR_PIN  26
 #define LIDAR_BAUD       115200
 #define LIDAR_TOPIC      "bas/BAS_LIDAR_001/telemetry"
+
+// ---------------- Dong co DC (driver PWM + DIR, kieu Cytron) ----------------
+#define MOTOR_PWM_PIN    23      // xung PWM (LEDC) -> chan PWM cua driver
+#define MOTOR_DIR_PIN    22      // chieu: HIGH = tien, LOW = lui
+#define MOTOR_PWM_FREQ   20000   // 20 kHz: tren nguong nghe, motor chay em
+#define MOTOR_PWM_RES    8       // 8 bit: duty 0..255 (core 3.x: ledcAttach tu chon kenh)
 
 // ---------------- Chip ----------------
 enum ChipType { CHIP_NONE, CHIP_HMC5883L, CHIP_QMC5883L };
@@ -316,7 +325,7 @@ static void clearCalibration() {
 }
 
 static void printHelp() {
-  Serial.println("Lenh: c = hieu chuan la ban | r = xoa hieu chuan | p = hieu chuan khung lidar | t <rong_m> <sau_m> = kich thuoc be | d = xem dinh vi | h = huong dan");
+  Serial.println("Lenh: c = hieu chuan la ban | r = xoa hieu chuan | p = hieu chuan khung lidar | t <rong_m> <sau_m> = kich thuoc be | d = xem dinh vi | m <toc do -100..100> = dong co DC | h = huong dan");
 }
 
 // ---------------- Huong ----------------
@@ -786,6 +795,48 @@ static void runFrameCalibration() {
                 (bE - bW) / 2000.0f, (bN - bS) / 2000.0f);
 }
 
+// ---------------- Dong co DC: trang thai + dieu khien ----------------
+#define MQTT_CMD_TOPIC "bas/" DEVICE_ID "/cmd"
+static volatile int      g_motorPct = 0;       // toc do dang chay, -100..100
+static volatile int      g_motorTarget = 0;    // toc do dich tu lenh MQTT
+static volatile bool     g_motorPending = false;
+static volatile uint32_t g_lastMqttOkMs = 0;   // lan publish MQTT thanh cong gan nhat (0 = chua bao gio)
+
+// Dat toc do dong co: pct -100..100 (am = lui). Deadband |pct| < 3 -> dung han.
+static void motorSet(int pct) {
+  if (pct > 100) pct = 100;
+  if (pct < -100) pct = -100;
+  if (pct > -3 && pct < 3) pct = 0;
+  digitalWrite(MOTOR_DIR_PIN, pct < 0 ? LOW : HIGH);
+  ledcWrite(MOTOR_PWM_PIN, (abs(pct) * 255) / 100);   // core 3.x: ghi theo chan, khong theo kenh
+  if (pct != g_motorPct) Serial.printf("[MOTOR] speed=%d\n", pct);
+  g_motorPct = pct;
+}
+
+// Callback MQTT (chay trong task mang): chi ghi muc tieu + dat co, loop() se ap dung.
+// Chap nhan {"motor":-100..100}, {"stop":1} hoac chuoi "stop". Sai dinh dang thi bo qua.
+static void mqttCallback(char *topic, uint8_t *payload, unsigned int len) {
+  (void)topic;
+  char buf[64];
+  unsigned int n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+  buf[n] = 0;
+  if (strstr(buf, "\"stop\"") || (n == 4 && memcmp(buf, "stop", 4) == 0)) {
+    g_motorTarget = 0;
+    g_motorPending = true;
+    return;
+  }
+  char *p = strstr(buf, "\"motor\"");
+  if (!p) return;
+  p = strchr(p, ':');
+  if (!p) return;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return;   // khong co so hop le
+  g_motorTarget = (int)strtol(p, nullptr, 10);
+  g_motorPending = true;
+}
+
 // ---- Wi-Fi: mang chinh + mang du phong (hotspot), tu thu lai lien tuc ----
 // Thu tu: mang dung duoc gan nhat truoc, roi toi mang con lai. Moi lan thu cho
 // toi da ~12 s; het cac mang ma chua vao duoc thi nghi 3 s roi lap lai tu dau.
@@ -839,6 +890,7 @@ static bool timeSync() {
 static void netTask(void *) {
   WiFiClientSecure tls;
   PubSubClient mqtt(tls);
+  mqtt.setCallback(mqttCallback);   // lenh dieu khien dong co qua MQTT_CMD_TOPIC
   uint32_t lastPublish = 0, publishCount = 0;
   uint32_t lastLidarRev = 0;
   float prevHdg = 0, prevT = 0, rotSmooth = 0;
@@ -864,6 +916,8 @@ static void netTask(void *) {
         continue;
       }
       NET_LOG("MQTT da ket noi, topic %s", MQTT_TOPIC);
+      mqtt.subscribe(MQTT_CMD_TOPIC);   // subscribe lai sau moi lan ket noi lai
+      NET_LOG("Da subscribe topic lenh %s", MQTT_CMD_TOPIC);
       lastPublish = millis() - PUBLISH_INTERVAL_MS;
       havePrev = false;
     }
@@ -888,11 +942,12 @@ static void netTask(void *) {
         prevHdg = hdg; prevT = t; havePrev = true;
         bool posOk = updatePosition(hdg);
         int n = snprintf(jsonBuf, sizeof jsonBuf,
-          "{\"x\":%.2f,\"y\":%.2f,\"hdg\":%.1f,\"rot\":%.1f,\"src\":\"esp32-fusion\",\"pos\":%d,\"cal\":%d,\"uptime_s\":%lu}",
-          posSmoothX, posSmoothY, hdg, rotSmooth, posOk ? 1 : 0, g_calibrated ? 1 : 0, (unsigned long)(millis() / 1000));
+          "{\"x\":%.2f,\"y\":%.2f,\"hdg\":%.1f,\"rot\":%.1f,\"src\":\"esp32-fusion\",\"pos\":%d,\"cal\":%d,\"uptime_s\":%lu,\"motor\":%d}",
+          posSmoothX, posSmoothY, hdg, rotSmooth, posOk ? 1 : 0, g_calibrated ? 1 : 0, (unsigned long)(millis() / 1000), (int)g_motorPct);
         if (n < 0 || (size_t)n >= sizeof jsonBuf) { NET_LOG("Payload khong vua buffer, bo qua"); }
         else if (mqtt.publish(MQTT_TOPIC, (const uint8_t *)jsonBuf, (size_t)n, false)) {
           publishCount++;
+          g_lastMqttOkMs = millis();   // moc cho failsafe dong co o loop()
           NET_LOG("#%lu hdg=%.1f rot=%+.1f |B|=%.1f cal=%d -> OK",
                   (unsigned long)publishCount, hdg, rotSmooth, g_mag, g_calibrated ? 1 : 0);
         } else {
@@ -925,6 +980,12 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== DPSHIP FUSION: GY-271 + RPLIDAR A1M8 ===");
+  // Dong co DC: cau hinh chan + PWM va dung han TRUOC moi thu khac (ke ca mang),
+  // dam bao motor khong bao gio tu quay ngay khi vua cap nguon.
+  pinMode(MOTOR_DIR_PIN, OUTPUT);
+  digitalWrite(MOTOR_DIR_PIN, HIGH);
+  ledcAttach(MOTOR_PWM_PIN, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  motorSet(0);
   i2cRestart();
 
   while (!initSensor()) {
@@ -999,6 +1060,19 @@ void loop() {
         Serial.println("[POS] Kich thuoc be khong hop le (can 2 so, vi du: t 3.60 2.40)");
       }
     }
+    else if (ch == 'm' || ch == 'M') {
+      motorSet((int)Serial.parseInt());   // test tai ban: m 50 | m -30 | m 0
+    }
+  }
+
+  // Ap dung lenh dong co tu MQTT (callback o task mang chi dat co)
+  if (g_motorPending) { g_motorPending = false; motorSet(g_motorTarget); }
+
+  // Failsafe: dang chay ma mat publish MQTT qua 5 s thi dung dong co
+  // (chi kich hoat sau khi da tung co mot phien MQTT thanh cong)
+  if (g_motorPct != 0 && g_lastMqttOkMs != 0 && millis() - g_lastMqttOkMs > 5000) {
+    motorSet(0);
+    Serial.println("[MOTOR] failsafe: mat ket noi MQTT -> dung dong co");
   }
 
   int16_t rx, ry, rz;

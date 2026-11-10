@@ -12,6 +12,7 @@ Dữ liệu được gửi qua **Wi-Fi → MQTT (TLS)** mỗi giây:
 |---|---|---|
 | Tàu | `bas/DP_SHIP_001/telemetry` | `{"x","y","hdg","rot","pos","cal","src":"esp32-fusion","uptime_s"}` |
 | Lidar | `bas/BAS_LIDAR_001/telemetry` | mảng `ranges` 360 ô (1 ô = 1°, đơn vị mm, 0 = không có vật) |
+| Lệnh xuống | `bas/DP_SHIP_001/cmd` | `{"motor": -100..100}` — điều khiển động cơ DC (mục 1.3); telemetry tàu cũng báo lại trường `"motor"` đang chạy |
 
 Nơi nhận dữ liệu:
 
@@ -67,7 +68,21 @@ Sơ đồ tổng:
                         └──────────────┘      └─── 5 GND ────── mass chung
 ```
 
-### 1.3 Quy tắc nguồn — đọc trước khi cắm
+### 1.3 Động cơ DC (điều khiển tốc độ + chiều qua web)
+
+Board xuất tín hiệu cho **module driver động cơ** loại PWM/DIR (ví dụ Cytron MD10C):
+
+| Tín hiệu | Chân ESP32 | Nối vào driver | Ghi chú |
+|---|---|---|---|
+| Xung tốc độ (PWM 20 kHz) | **GPIO23** | chân **PWM** của driver | độ rộng xung theo % tốc độ |
+| Chiều quay | **GPIO22** | chân **DIR** của driver | mức CAO = tiến, mức THẤP = lùi (ngược thực tế thì đảo 2 dây động cơ) |
+
+- Thang tốc độ **−100% … +100%**: dương = tiến, âm = lùi, 0 = dừng; vùng chết ±3% quanh 0.
+- Điều khiển từ **web tàu 3D** (popup 🎛 ĐIỀU KHIỂN → mục ĐỘNG CƠ DC, thanh trượt −100…+100) hoặc lệnh MQTT `{"motor": <số>}` tới topic `bas/DP_SHIP_001/cmd`; gửi `{"stop":1}` để dừng.
+- An toàn: mở nguồn lên động cơ **đứng yên** chờ lệnh; đang chạy mà mất kết nối MQTT quá 5 giây → **tự dừng**.
+- Nguồn động cơ cấp riêng qua driver theo thông số của driver/động cơ — **không** lấy nguồn động cơ từ ESP32; mass của driver vẫn phải **chung mass** với ESP32.
+
+### 1.4 Quy tắc nguồn — đọc trước khi cắm
 
 - **ESP32 cấp nguồn riêng bằng USB** (máy tính hoặc củ sạc 5V). **Không** nối nguồn 5V ngoài vào chân 5V/VIN của ESP32.
 - **Lidar dùng nguồn 5V ngoài riêng** (chân V5.0 + VMOTO). Motor lidar ăn dòng lớn; nguồn yếu → lidar không quay hoặc ESP32 reset vòng lặp.
@@ -103,6 +118,7 @@ Nhờ vậy mang ra triển lãm chỉ cần bật hotspot điện thoại là b
 | `p` | Hiệu chuẩn trục lidar ↔ la bàn (giữ rig đứng yên, xung quanh là vách chữ nhật) |
 | `t 3.60 2.40` | Đặt kích thước lòng bể: rộng × sâu (mét) — dùng để kiểm tra tính hợp lệ của vị trí |
 | `d` | In trạng thái định vị hiện tại (trục, kích thước bể, khoảng cách 4 vách, x/y) |
+| `m 50` | Chạy động cơ DC tại bàn: `m <số>` với số −100..100 (âm = lùi, `m 0` = dừng) |
 
 ## 5. Cài đặt và nạp code
 
